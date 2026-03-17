@@ -1,0 +1,5 @@
+{"id": "log_A_1773761229.5062478", "timestamp": 1773761229506, "location": "utils.py", "message": "utils.py execution started", "data": {"__file__": "c:\\Users\\gilad\\CursorProjects\\Vocabulary Level Prediction\\utils.py", "sys.executable": "c:\\Users\\gilad\\CursorProjects\\Vocabulary Level Prediction\\.venv\\Scripts\\python.exe", "sys.path[0]": "C:\\Users\\gilad\\AppData\\Local\\Programs\\Python\\Python310\\python310.zip"}, "hypothesisId": "A"}
+{"id": "log_C_1773761229.510449", "timestamp": 1773761229510, "location": "utils.py", "message": "after re,pandas", "data": {}, "hypothesisId": "C"}
+{"id": "log_C_1773761229.510449", "timestamp": 1773761229510, "location": "utils.py", "message": "after matplotlib", "data": {"plt_is_none": false}, "hypothesisId": "C"}
+{"id": "log_C_1773761239.0317721", "timestamp": 1773761239032, "location": "utils.py", "message": "after sklearn", "data": {"cohen_kappa_is_none": false}, "hypothesisId": "C"}
+{"id": "log_C_1773761239.0317721", "timestamp": 1773761239032, "location": "utils.py", "message": "about to define get_missing_counts", "data": {}, "hypothesisId": "C"}
