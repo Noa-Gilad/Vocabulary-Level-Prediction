@@ -1,2 +1,6 @@
 # Dataset (do not commit)
 vocabulary_data.csv
+Data/
+
+# Cursor IDE (debug log etc.)
+.cursor/
