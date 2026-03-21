@@ -4,14 +4,24 @@ Modeling utilities for vocabulary-level prediction.
 Functions for target creation, rater-agreement filtering,
 cross-validation evaluation, sample-weight generation, experiment
 orchestration (``run_all_experiments_cv`` for the full registry; ``run_registry_experiments_cv`` for row subsets),
-leaderboard aggregation, and CV visualization.
-Reuses feature-extraction helpers from utils.py where they exist.
+leaderboard aggregation, CV visualization, and Optuna helpers
+(``optuna_optimize_with_stratified_cv`` plus thin TF-IDF+SVD+MLP wrappers).
+Feature extraction for text/embeddings stays in ``utils.py``; this module orchestrates models.
 """
 
 from __future__ import annotations
 
+import os
 import warnings
-from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
+from contextlib import nullcontext
+from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
+
+# Limit BLAS/OpenMP oversubscription during sklearn fits so the kernel stays responsive to
+# interrupts (multi-threaded native code can otherwise ignore Ctrl+C for long stretches).
+try:
+    from threadpoolctl import threadpool_limits
+except ImportError:  # pragma: no cover
+    threadpool_limits = None  # type: ignore[misc, assignment]
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -24,12 +34,21 @@ from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
 )
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 from sklearn.neural_network import MLPRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
+
+try:
+    import optuna
+    from optuna.pruners import MedianPruner
+    from optuna.samplers import TPESampler
+except ImportError:  # pragma: no cover
+    optuna = None  # type: ignore[misc, assignment]
+    MedianPruner = None  # type: ignore[misc, assignment]
+    TPESampler = None  # type: ignore[misc, assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +149,8 @@ def build_text_target_dataset(
     """
     required_columns = [text_column, target_column]
     missing_columns = [
-        column_name for column_name in required_columns
+        column_name
+        for column_name in required_columns
         if column_name not in data_frame.columns
     ]
     if missing_columns:
@@ -236,9 +256,7 @@ def compute_qwk(
     float
         QWK score; may be ``nan`` if sklearn cannot compute kappa (degenerate fold).
     """
-    y_pred_rounded = round_and_clip_predictions(
-        y_pred_continuous, min_score, max_score
-    )
+    y_pred_rounded = round_and_clip_predictions(y_pred_continuous, min_score, max_score)
     ordinal_labels = np.arange(min_score, max_score + 1)
     kappa = cohen_kappa_score(
         y_true,
@@ -397,12 +415,17 @@ DEFAULT_TFIDF_VECTORIZER_KWARGS: Dict[str, Any] = {
     "max_df": 0.95,
 }
 
+# Default ``max_iter`` search range for Optuna MLP trials (early stopping still applies).
+OPTUNA_MLP_MAX_ITER_BOUNDS: Tuple[int, int] = (300, 800)
+
 # Tree / boosting short names: on the embedding track we skip StandardScaler (plan).
-DEFAULT_EMBEDDING_TREE_MODEL_SHORT_NAMES: frozenset[str] = frozenset({
-    "RF",
-    "XGB",
-    "LGBM",
-})
+DEFAULT_EMBEDDING_TREE_MODEL_SHORT_NAMES: frozenset[str] = frozenset(
+    {
+        "RF",
+        "XGB",
+        "LGBM",
+    }
+)
 
 
 def make_handcrafted_regression_pipeline(final_estimator: Any) -> Pipeline:
@@ -419,10 +442,12 @@ def make_handcrafted_regression_pipeline(final_estimator: Any) -> Pipeline:
     Pipeline
         Fitted per CV fold on train indices only.
     """
-    return Pipeline([
-        ("scaler", StandardScaler()),
-        ("model", final_estimator),
-    ])
+    return Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            ("model", final_estimator),
+        ]
+    )
 
 
 def make_embeddings_regression_pipeline(
@@ -452,10 +477,12 @@ def make_embeddings_regression_pipeline(
     """
     if model_short_name in tree_model_short_names:
         return final_estimator
-    return Pipeline([
-        ("scaler", StandardScaler()),
-        ("model", final_estimator),
-    ])
+    return Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            ("model", final_estimator),
+        ]
+    )
 
 
 def make_tfidf_regression_pipeline(
@@ -477,10 +504,12 @@ def make_tfidf_regression_pipeline(
     Pipeline
         Full text pipeline for one experiment.
     """
-    return Pipeline([
-        ("tfidf", TfidfVectorizer(**dict(vectorizer_kwargs))),
-        ("model", final_estimator),
-    ])
+    return Pipeline(
+        [
+            ("tfidf", TfidfVectorizer(**dict(vectorizer_kwargs))),
+            ("model", final_estimator),
+        ]
+    )
 
 
 def make_tfidf_mlp_pipeline(
@@ -524,11 +553,16 @@ def make_tfidf_mlp_pipeline(
             n_iter_no_change=15,
             random_state=random_state,
         )
-    return Pipeline([
-        ("tfidf", TfidfVectorizer(**dict(vectorizer_kwargs))),
-        ("svd", TruncatedSVD(n_components=n_svd_components, random_state=random_state)),
-        ("mlp", mlp_estimator),
-    ])
+    return Pipeline(
+        [
+            ("tfidf", TfidfVectorizer(**dict(vectorizer_kwargs))),
+            (
+                "svd",
+                TruncatedSVD(n_components=n_svd_components, random_state=random_state),
+            ),
+            ("mlp", mlp_estimator),
+        ]
+    )
 
 
 def build_pipeline_for_track(
@@ -592,7 +626,8 @@ def build_pipeline_for_track(
                 mlp_estimator=final_estimator,
             )
         return make_tfidf_regression_pipeline(
-            final_estimator, vectorizer_kwargs=tfidf_vectorizer_kwargs,
+            final_estimator,
+            vectorizer_kwargs=tfidf_vectorizer_kwargs,
         )
     raise ValueError(
         f"Unknown feature_source: {feature_source!r}. "
@@ -652,11 +687,13 @@ def build_experiments_from_grid(
                 tfidf_mlp_short_name=tfidf_mlp_short_name,
                 embedding_tree_model_short_names=embedding_tree_model_short_names,
             )
-            experiments.append({
-                "name": f"{name_prefix}_{model_short_name}",
-                "feature_source": feature_source,
-                "pipeline": pipeline,
-            })
+            experiments.append(
+                {
+                    "name": f"{name_prefix}_{model_short_name}",
+                    "feature_source": feature_source,
+                    "pipeline": pipeline,
+                }
+            )
     return experiments
 
 
@@ -727,11 +764,13 @@ def build_experiments_from_track_specs(
                 tfidf_mlp_short_name=tfidf_mlp_short_name,
                 embedding_tree_model_short_names=embedding_tree_model_short_names,
             )
-            experiments.append({
-                "name": f"{name_prefix}_{model_short_name}",
-                "feature_source": feature_source,
-                "pipeline": pipeline,
-            })
+            experiments.append(
+                {
+                    "name": f"{name_prefix}_{model_short_name}",
+                    "feature_source": feature_source,
+                    "pipeline": pipeline,
+                }
+            )
 
     return experiments
 
@@ -851,7 +890,9 @@ def _validate_raw_text_features_for_tfidf_pipeline(
             )
         return
 
-    if series.dtype.kind in ("i", "u", "f", "c") or np.issubdtype(series.dtype, np.number):
+    if series.dtype.kind in ("i", "u", "f", "c") or np.issubdtype(
+        series.dtype, np.number
+    ):
         raise ValueError(
             "TF-IDF CV: numeric Series dtype. Pass object/string text (e.g. Text_cleaned)."
         )
@@ -908,6 +949,77 @@ def _get_sample_weight_param_name(pipeline_or_model: Any) -> str:
     return "sample_weight"
 
 
+def stratified_subsample_for_optuna_objective(
+    raw_text_series: pd.Series,
+    target_values: np.ndarray,
+    stratification_bins: np.ndarray | None,
+    n_samples: int,
+    random_state: int,
+) -> Tuple[pd.Series, np.ndarray, np.ndarray | None]:
+    """
+    Draw a stratified random subset of rows for fast Optuna objectives (approximate ranking).
+
+    One-line purpose
+        Shrink TF-IDF + MLP CV cost per trial while preserving class balance in fold splits.
+
+    Parameters
+    ----------
+    raw_text_series : pd.Series
+        Full-corpus cleaned text (same order as ``target_values``).
+    target_values : np.ndarray
+        Ordinal targets (length ``n``).
+    stratification_bins : np.ndarray | None
+        Labels for stratification; if None, uses ``target_values``.
+    n_samples : int
+        Target subset size (capped at ``n``).
+    random_state : int
+        RNG seed for reproducible subsampling.
+
+    Returns
+    -------
+    Tuple[pd.Series, np.ndarray, np.ndarray | None]
+        ``(text_subset, y_subset, strat_subset_or_none)`` with ``len == min(n_samples, n)``.
+    """
+    y = np.asarray(target_values)
+    n_total = int(y.shape[0])
+    if n_total == 0:
+        raise ValueError("target_values is empty.")
+    strat = stratification_bins if stratification_bins is not None else y
+    strat = np.asarray(strat)
+    if strat.shape[0] != n_total:
+        raise ValueError("stratification_bins must align with target_values length.")
+
+    take = min(int(n_samples), n_total)
+    if take == n_total:
+        return raw_text_series.reset_index(drop=True), y, stratification_bins
+
+    # One split yields a stratified train set of exactly ``take`` rows (when feasible).
+    try:
+        splitter = StratifiedShuffleSplit(
+            n_splits=1,
+            train_size=take,
+            random_state=random_state,
+        )
+        train_idx, _ = next(splitter.split(np.zeros(n_total), strat))
+    except ValueError as exc:
+        warnings.warn(
+            "Stratified subsample failed; falling back to unstratified indices. "
+            f"Reason: {exc}",
+            UserWarning,
+            stacklevel=2,
+        )
+        rng = np.random.RandomState(random_state)
+        train_idx = rng.choice(n_total, size=take, replace=False)
+
+    idx = np.sort(train_idx.astype(int, copy=False))
+    text_sub = raw_text_series.iloc[idx].reset_index(drop=True)
+    y_sub = y[idx]
+    strat_sub = strat[idx]
+    if stratification_bins is None:
+        return text_sub, y_sub, None
+    return text_sub, y_sub, strat_sub
+
+
 def run_stratified_cv(
     model: Any,
     feature_matrix: np.ndarray | pd.DataFrame | pd.Series,
@@ -918,6 +1030,10 @@ def run_stratified_cv(
     use_sample_weights: bool = True,
     min_score: int = 0,
     max_score: int = 5,
+    after_each_fold: Optional[Callable[[int, Dict[str, float]], None]] = None,
+    *,
+    verbose: bool = False,
+    limit_blas_threads: bool = False,
 ) -> pd.DataFrame:
     """
     Stratified K-fold CV for one regressor; returns per-fold metrics.
@@ -948,6 +1064,15 @@ def run_stratified_cv(
         Lower bound for QWK rounding.
     max_score : int
         Upper bound for QWK rounding.
+    after_each_fold : callable, optional
+        If set, called as ``after_each_fold(fold_number, metrics_dict)`` after each
+        fold with keys qwk, rmse, mae (for Optuna pruning / logging).
+    verbose : bool
+        If True, print each fold before/after fit so long runs show progress (flush stdout).
+    limit_blas_threads : bool
+        If True, wrap each ``fit`` in ``threadpoolctl.threadpool_limits(1)`` when available
+        so BLAS/OpenMP does not use all cores; this often makes Jupyter **Interrupt** / Ctrl+C
+        responsive again. If ``threadpoolctl`` is not installed, this flag has no effect.
 
     Returns
     -------
@@ -986,6 +1111,21 @@ def run_stratified_cv(
 
         fold_model = clone(model)
 
+        if verbose:
+            print(
+                f"  CV fold {fold_number}/{n_splits}: train n={len(train_idx)} "
+                f"→ fitting...",
+                flush=True,
+            )
+
+        # Single-thread BLAS during fit reduces oversubscription and helps the IPython kernel
+        # process SIGINT/Interrupt between native calls (optional; requires threadpoolctl).
+        _blas_limit_ctx = (
+            threadpool_limits(limits=1)
+            if (limit_blas_threads and threadpool_limits is not None)
+            else nullcontext()
+        )
+
         # LightGBM + TfidfVectorizer Pipeline quirk: LGBMRegressor records sparse-
         # matrix column indices as "feature names" during fit(), then warns on
         # predict() when the validation sparse matrix lacks the same metadata.
@@ -998,18 +1138,30 @@ def run_stratified_cv(
                 category=UserWarning,
             )
 
-            if use_sample_weights:
-                weights = compute_balanced_sample_weights(y_train)
-                weight_param = _get_sample_weight_param_name(fold_model)
-                fold_model.fit(X_train, y_train, **{weight_param: weights})
-            else:
-                fold_model.fit(X_train, y_train)
+            with _blas_limit_ctx:
+                if use_sample_weights:
+                    weights = compute_balanced_sample_weights(y_train)
+                    weight_param = _get_sample_weight_param_name(fold_model)
+                    fold_model.fit(X_train, y_train, **{weight_param: weights})
+                else:
+                    fold_model.fit(X_train, y_train)
 
             y_pred = fold_model.predict(X_valid)
 
         metrics = evaluate_fold(y_valid, y_pred, min_score, max_score)
         metrics["fold"] = fold_number
         fold_rows.append(metrics)
+        if verbose:
+            print(
+                f"  CV fold {fold_number}/{n_splits}: "
+                f"QWK={metrics['qwk']:.4f} RMSE={metrics['rmse']:.4f} MAE={metrics['mae']:.4f}",
+                flush=True,
+            )
+        if after_each_fold is not None:
+            after_each_fold(
+                fold_number,
+                {"qwk": metrics["qwk"], "rmse": metrics["rmse"], "mae": metrics["mae"]},
+            )
 
     return pd.DataFrame(fold_rows)[["fold", "qwk", "rmse", "mae"]]
 
@@ -1080,7 +1232,9 @@ def run_registry_experiments_cv(
             f"run_experiment length {run_flags.shape[0]} != len(experiments) {len(experiments)}."
         )
     if not np.any(run_flags):
-        raise ValueError("run_experiment is all False; set at least one True to run CV.")
+        raise ValueError(
+            "run_experiment is all False; set at least one True to run CV."
+        )
 
     all_fold_results: List[pd.DataFrame] = []
 
@@ -1189,14 +1343,16 @@ def build_cv_leaderboard(all_fold_results: pd.DataFrame) -> pd.DataFrame:
     """
     grouped = all_fold_results.groupby("experiment")
 
-    leaderboard = pd.DataFrame({
-        "qwk_mean": grouped["qwk"].mean(),
-        "qwk_std": grouped["qwk"].std(),
-        "rmse_mean": grouped["rmse"].mean(),
-        "rmse_std": grouped["rmse"].std(),
-        "mae_mean": grouped["mae"].mean(),
-        "mae_std": grouped["mae"].std(),
-    })
+    leaderboard = pd.DataFrame(
+        {
+            "qwk_mean": grouped["qwk"].mean(),
+            "qwk_std": grouped["qwk"].std(),
+            "rmse_mean": grouped["rmse"].mean(),
+            "rmse_std": grouped["rmse"].std(),
+            "mae_mean": grouped["mae"].mean(),
+            "mae_std": grouped["mae"].std(),
+        }
+    )
 
     leaderboard = leaderboard.sort_values(
         by=["qwk_mean", "mae_mean"],
@@ -1269,7 +1425,8 @@ def plot_cv_metric_bars(
         The figure object.
     """
     sorted_df = leaderboard.sort_values(
-        metric_mean_col, ascending=not higher_is_better,
+        metric_mean_col,
+        ascending=not higher_is_better,
     )
 
     fig, ax = plt.subplots(figsize=figsize)
@@ -1328,9 +1485,7 @@ def plot_cv_fold_boxplot(
 
     fig, ax = plt.subplots(figsize=figsize)
     box_data = [
-        all_fold_results.loc[
-            all_fold_results["experiment"] == exp, metric
-        ].values
+        all_fold_results.loc[all_fold_results["experiment"] == exp, metric].values
         for exp in experiment_order
     ]
     ax.boxplot(box_data, labels=experiment_order, vert=True)
@@ -1339,3 +1494,685 @@ def plot_cv_fold_boxplot(
     ax.set_title(title)
     fig.tight_layout()
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Hyperparameter tuning: generic Optuna + stratified CV; TF-IDF+SVD+MLP wrappers
+# ---------------------------------------------------------------------------
+
+
+def _require_optuna() -> None:
+    """
+    Raise ImportError if Optuna is not installed.
+
+    One-line purpose
+        Guard Optuna-only entry points when the optional dependency is missing.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+    """
+    if optuna is None:
+        raise ImportError(
+            "optuna is required for hyperparameter tuning. Install with: pip install optuna"
+        )
+
+
+def _apply_blas_thread_env_defaults() -> None:
+    """
+    Set common BLAS/OpenMP thread env vars to 1 when unset.
+
+    One-line purpose
+        Reduce many-core oversubscription so notebook interrupts and Optuna behave better.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+        Side effect: may set ``OMP_NUM_THREADS``, ``OPENBLAS_NUM_THREADS``, etc.
+    """
+    for key in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ.setdefault(key, "1")
+
+
+def _optuna_study_to_trials_dataframe(study: Any) -> pd.DataFrame:
+    """
+    Flatten an Optuna ``Study`` into a pandas table (params + mean QWK/RMSE/MAE user attrs).
+
+    One-line purpose
+        Shared export format for any study created by ``optuna_optimize_with_stratified_cv``.
+
+    Parameters
+    ----------
+    study : optuna.study.Study
+        Completed or partially completed study.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per trial: ``number``, ``state``, ``qwk_mean``, ``rmse_mean``, ``mae_mean``,
+        ``value``, plus flattened ``trial.params``.
+    """
+    rows: List[Dict[str, Any]] = []
+    for t in study.trials:
+        row: Dict[str, Any] = {
+            "number": t.number,
+            "state": str(t.state),
+            "qwk_mean": t.user_attrs.get("qwk_mean"),
+            "rmse_mean": t.user_attrs.get("rmse_mean"),
+            "mae_mean": t.user_attrs.get("mae_mean"),
+            "value": t.value,
+        }
+        row.update(t.params)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def optuna_optimize_with_stratified_cv(
+    build_estimator: Callable[[Any], Any],
+    raw_text_series: pd.Series,
+    target_values: np.ndarray,
+    stratification_bins: np.ndarray | None,
+    *,
+    n_trials: int = 30,
+    n_splits: int = 5,
+    random_state: int = 42,
+    use_sample_weights: bool = True,
+    optuna_seed: int = 42,
+    min_score: int = 0,
+    max_score: int = 5,
+    use_pruner: bool = True,
+    verbose_cv: bool = False,
+    limit_blas_threads: bool = True,
+    show_progress_bar: bool = True,
+    objective_subsample_n: Optional[int] = None,
+) -> Tuple[Any, pd.DataFrame]:
+    """
+    Generic Bayesian (TPE) loop: each trial builds an estimator, then ``run_stratified_cv``.
+
+    The objective is **maximize mean validation QWK** (same metric stack as Section 4).
+    ``build_estimator(trial)`` must return an **unfitted** sklearn estimator or Pipeline
+    (e.g. suggest hyperparameters via ``trial.suggest_*`` and construct the model).
+
+    One-line purpose
+        Reusable Optuna driver for any model that fits the project's stratified CV protocol.
+
+    Parameters
+    ----------
+    build_estimator : Callable[[optuna.trial.Trial], Any]
+        Maps a trial to an unfitted estimator. Use ``trial.suggest_*`` inside for search space.
+    raw_text_series : pd.Series
+        Row-aligned cleaned text when the model is a TF-IDF pipeline; otherwise aligned features.
+    target_values : np.ndarray
+        Ordinal targets for evaluation.
+    stratification_bins : np.ndarray | None
+        Stratification labels for ``StratifiedKFold`` (optional bin merging).
+    n_trials : int
+        Number of Optuna trials.
+    n_splits : int
+        Number of CV folds.
+    random_state : int
+        Seed for CV splits (and any step inside ``build_estimator`` that uses it).
+    use_sample_weights : bool
+        If True, balanced sample weights on each train fold.
+    optuna_seed : int
+        Seed for the TPE sampler.
+    min_score : int
+        Lower clip for QWK rounding in ``evaluate_fold``.
+    max_score : int
+        Upper clip for QWK rounding in ``evaluate_fold``.
+    use_pruner : bool
+        If True, ``MedianPruner`` with per-fold reporting of **QWK** (matches ``direction="maximize"``:
+        higher fold QWK is better; do **not** negate—negated values invert pruning vs. the study).
+    verbose_cv : bool
+        If True, print Optuna trial headers and per-fold CV lines (see ``run_stratified_cv``).
+    limit_blas_threads : bool
+        If True, set single-thread BLAS env defaults (if unset) and pass
+        ``limit_blas_threads=True`` into ``run_stratified_cv`` so ``threadpoolctl`` can cap BLAS
+        during each ``fit`` — improves Jupyter interrupt handling on many-core CPUs.
+    show_progress_bar : bool
+        Passed to ``study.optimize`` (Optuna tqdm bar advances once per **completed trial**).
+    objective_subsample_n : int, optional
+        If set to a positive integer **below** the number of rows, the study optimizes QWK on a
+        **stratified random subset** of that size (same protocol, cheaper TF-IDF + MLP per trial).
+        Use for hyperparameter **screening**; validate the winner on full data separately.
+
+    Returns
+    -------
+    Tuple[Any, pd.DataFrame]
+        ``(study, trials_table)`` with mean QWK/RMSE/MAE per completed trial.
+    """
+    _require_optuna()
+    if limit_blas_threads:
+        _apply_blas_thread_env_defaults()
+
+    # Optional subsample: dominates wall time for text pipelines (vectorizer × folds × trials).
+    n_full = int(len(raw_text_series))
+    if objective_subsample_n is not None and objective_subsample_n > 0:
+        if objective_subsample_n < n_full:
+            raw_text_series, target_values, stratification_bins = (
+                stratified_subsample_for_optuna_objective(
+                    raw_text_series=raw_text_series,
+                    target_values=target_values,
+                    stratification_bins=stratification_bins,
+                    n_samples=objective_subsample_n,
+                    random_state=random_state,
+                )
+            )
+            if verbose_cv:
+                print(
+                    f"Optuna objective uses stratified subsample: "
+                    f"n={len(raw_text_series)} of {n_full} rows (faster trials).",
+                    flush=True,
+                )
+        elif verbose_cv:
+            print(
+                f"Optuna objective uses full data (n={n_full}); "
+                f"objective_subsample_n={objective_subsample_n} >= n.",
+                flush=True,
+            )
+
+    def objective(trial: Any) -> float:
+        if verbose_cv:
+            print(
+                f"\nOptuna trial {trial.number + 1}/{n_trials}: "
+                f"{n_splits}-fold CV (mean QWK objective)...",
+                flush=True,
+            )
+        model = build_estimator(trial)
+
+        def after_fold(fold_number: int, metrics: Dict[str, float]) -> None:
+            # Report raw QWK so pruning sees the same "higher is better" scale as the study
+            # (direction="maximize"). Reporting -QWK inverted MedianPruner vs. true QWK.
+            if use_pruner and optuna is not None:
+                trial.report(metrics["qwk"], step=fold_number - 1)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+
+        fold_df = run_stratified_cv(
+            model=model,
+            feature_matrix=raw_text_series,
+            target_values=target_values,
+            stratification_bins=stratification_bins,
+            n_splits=n_splits,
+            random_state=random_state,
+            use_sample_weights=use_sample_weights,
+            min_score=min_score,
+            max_score=max_score,
+            after_each_fold=after_fold if use_pruner else None,
+            verbose=verbose_cv,
+            limit_blas_threads=limit_blas_threads,
+        )
+
+        qwk_mean = float(fold_df["qwk"].mean())
+        trial.set_user_attr("rmse_mean", float(fold_df["rmse"].mean()))
+        trial.set_user_attr("mae_mean", float(fold_df["mae"].mean()))
+        trial.set_user_attr("qwk_mean", qwk_mean)
+        return qwk_mean
+
+    sampler = TPESampler(seed=optuna_seed) if TPESampler is not None else None
+    pruner = MedianPruner(n_startup_trials=5) if (use_pruner and MedianPruner) else None
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=sampler,
+        pruner=pruner,
+    )
+    study.set_user_attr("objective_n_rows", int(len(raw_text_series)))
+    study.set_user_attr("objective_subsample_n_requested", objective_subsample_n)
+    study.set_user_attr("objective_full_corpus_n_rows", n_full)
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        show_progress_bar=show_progress_bar,
+        gc_after_trial=True,
+    )
+
+    return study, _optuna_study_to_trials_dataframe(study)
+
+
+# Optuna categorical params must be JSON-serializable (no tuple choices); use string labels.
+_MLP_HIDDEN_LAYER_SIZE_LABELS: Tuple[str, ...] = ("128", "256", "512", "256x128")
+_MLP_HIDDEN_LAYER_SIZE_LABEL_TO_TUPLE: Dict[str, Tuple[int, ...]] = {
+    "128": (128,),
+    "256": (256,),
+    "512": (512,),
+    "256x128": (256, 128),
+}
+
+
+def parse_optuna_mlp_hidden_layer_sizes(value: Any) -> Tuple[int, ...]:
+    """
+    Convert Optuna's stored ``hidden_layer_sizes`` (str label or legacy tuple) to a sklearn tuple.
+
+    One-line purpose
+        Rebuild ``MLPRegressor(hidden_layer_sizes=...)`` from ``study.best_trial.params``.
+
+    Parameters
+    ----------
+    value : Any
+        String label from Optuna (e.g. ``\"256x128\"``) or a legacy tuple from old studies.
+
+    Returns
+    -------
+    Tuple[int, ...]
+        Layer widths for ``MLPRegressor``.
+    """
+    if isinstance(value, tuple):
+        return value
+    if isinstance(value, str) and value in _MLP_HIDDEN_LAYER_SIZE_LABEL_TO_TUPLE:
+        return _MLP_HIDDEN_LAYER_SIZE_LABEL_TO_TUPLE[value]
+    raise ValueError(
+        f"Unknown hidden_layer_sizes value: {value!r}. "
+        f"Expected one of {list(_MLP_HIDDEN_LAYER_SIZE_LABEL_TO_TUPLE)} or a tuple."
+    )
+
+
+def _mlp_params_from_optuna_trial(
+    trial: Any,
+    *,
+    random_state: int,
+    max_iter_bounds: Tuple[int, int] = OPTUNA_MLP_MAX_ITER_BOUNDS,
+) -> Dict[str, Any]:
+    """
+    Sample ``MLPRegressor`` kwargs from one Optuna trial (TPE-friendly search space).
+
+    One-line purpose
+        Map ``trial.suggest_*`` calls to a flat dict for ``MLPRegressor(**kwargs)``.
+
+    Parameters
+    ----------
+    trial : optuna.trial.Trial
+        Active Optuna trial.
+    random_state : int
+        Seed for ``MLPRegressor(random_state=...)``.
+    max_iter_bounds : Tuple[int, int]
+        Inclusive ``(low, high)`` for ``trial.suggest_int`` on ``max_iter`` (default
+        ``OPTUNA_MLP_MAX_ITER_BOUNDS``). With ``early_stopping=True``, this bounds wall time
+        per fold; increase if training stops before convergence.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Keyword arguments for ``MLPRegressor``.
+    """
+    low, high = max_iter_bounds
+    if low > high or low < 1:
+        raise ValueError(f"Invalid max_iter_bounds: {max_iter_bounds!r}")
+
+    # Strings only: Optuna warns if categorical choices are tuples (non-JSON persistent storage).
+    hls_label = trial.suggest_categorical(
+        "hidden_layer_sizes",
+        list(_MLP_HIDDEN_LAYER_SIZE_LABELS),
+    )
+    return {
+        "hidden_layer_sizes": _MLP_HIDDEN_LAYER_SIZE_LABEL_TO_TUPLE[hls_label],
+        "alpha": trial.suggest_float("alpha", 1e-5, 1e-1, log=True),
+        "learning_rate_init": trial.suggest_float(
+            "learning_rate_init", 1e-4, 5e-2, log=True
+        ),
+        "batch_size": trial.suggest_categorical(
+            "batch_size", [32, 64, 128, 256]
+        ),
+        "max_iter": trial.suggest_int("max_iter", low, high),
+        "activation": trial.suggest_categorical("activation", ["relu", "tanh"]),
+        "random_state": random_state,
+    }
+
+
+def optuna_tune_tfidf_mlp(
+    raw_text_series: pd.Series,
+    target_values: np.ndarray,
+    stratification_bins: np.ndarray | None,
+    vectorizer_kwargs: Mapping[str, Any],
+    *,
+    svd_n_components: int = 300,
+    mlp_fixed_kwargs: Mapping[str, Any] | None = None,
+    n_trials: int = 30,
+    n_splits: int = 5,
+    random_state: int = 42,
+    use_sample_weights: bool = True,
+    optuna_seed: int = 42,
+    min_score: int = 0,
+    max_score: int = 5,
+    use_pruner: bool = True,
+    mlp_max_iter_bounds: Tuple[int, int] = OPTUNA_MLP_MAX_ITER_BOUNDS,
+    verbose_cv: bool = False,
+    limit_blas_threads: bool = True,
+    show_progress_bar: bool = True,
+    objective_subsample_n: Optional[int] = 4000,
+) -> Tuple[Any, pd.DataFrame]:
+    """
+    Bayesian (TPE) search for ``TfidfVectorizer`` → ``TruncatedSVD`` → ``MLPRegressor``.
+
+    Thin wrapper around ``optuna_optimize_with_stratified_cv``: only defines ``build_estimator``
+    (MLP search space + fixed SVD width). Same CV and metrics as Section 4.
+
+    One-line purpose
+        Phase A: tune MLP with fixed ``svd_n_components`` using the shared Optuna CV driver.
+
+    Parameters
+    ----------
+    raw_text_series : pd.Series
+        Row-aligned cleaned text (Section 4 ``tfidf`` feature input).
+    target_values : np.ndarray
+        Ordinal target vector.
+    stratification_bins : np.ndarray | None
+        Bins for ``StratifiedKFold`` (e.g. ``build_stratification_bins``).
+    vectorizer_kwargs : Mapping[str, Any]
+        ``TfidfVectorizer`` kwargs — use the **same** ``tfidf`` settings as Section 4 (e.g.
+        ``DEFAULT_TFIDF_VECTORIZER_KWARGS``); this function does not alter them.
+    svd_n_components : int
+        Fixed SVD width for Phase A (MLP-only tuning).
+    mlp_fixed_kwargs : Mapping[str, Any] | None
+        Extra MLP kwargs merged before trial params (trial overrides on conflict).
+    n_trials : int
+        Optuna trial budget.
+    n_splits : int
+        CV folds.
+    random_state : int
+        CV + MLP/SVD reproducibility seed.
+    use_sample_weights : bool
+        Balanced weights on train folds (match Section 4).
+    optuna_seed : int
+        TPE sampler seed.
+    min_score : int
+        QWK clip low.
+    max_score : int
+        QWK clip high.
+    use_pruner : bool
+        If True, ``MedianPruner`` with per-fold QWK (same maximize semantics as the study).
+    mlp_max_iter_bounds : Tuple[int, int]
+        Inclusive bounds for Optuna ``max_iter`` (default ``OPTUNA_MLP_MAX_ITER_BOUNDS``).
+    verbose_cv : bool
+        If True, print each CV fold (passed through to the generic Optuna driver).
+    limit_blas_threads : bool
+        If True, cap BLAS threads during ``fit`` (better Jupyter interrupt behavior).
+    show_progress_bar : bool
+        Optuna tqdm bar (one tick per completed trial).
+    objective_subsample_n : int, optional
+        Stratified row count for the **Optuna objective only** (default ``4000``). Set ``None``
+        to use the full corpus (slow). Subsample mean QWK ranks configs; it is not comparable
+        to full-data Section 4 scores.
+
+    Returns
+    -------
+    Tuple[Any, pd.DataFrame]
+        ``(optuna.Study, trials_table)`` with columns including ``qwk_mean``, ``rmse_mean``,
+        ``mae_mean``, and suggested hyperparameters.
+    """
+    mlp_baseline: Dict[str, Any] = {
+        "early_stopping": True,
+        "validation_fraction": 0.1,
+        "n_iter_no_change": 15,
+    }
+    mlp_baseline.update(dict(mlp_fixed_kwargs or {}))
+
+    def build_estimator(trial: Any) -> Pipeline:
+        suggested = _mlp_params_from_optuna_trial(
+            trial,
+            random_state=random_state,
+            max_iter_bounds=mlp_max_iter_bounds,
+        )
+        mlp_kwargs = {**mlp_baseline, **suggested}
+        return make_tfidf_mlp_pipeline(
+            vectorizer_kwargs=vectorizer_kwargs,
+            n_svd_components=svd_n_components,
+            mlp_estimator=MLPRegressor(**mlp_kwargs),
+            random_state=random_state,
+        )
+
+    return optuna_optimize_with_stratified_cv(
+        build_estimator=build_estimator,
+        raw_text_series=raw_text_series,
+        target_values=target_values,
+        stratification_bins=stratification_bins,
+        n_trials=n_trials,
+        n_splits=n_splits,
+        random_state=random_state,
+        use_sample_weights=use_sample_weights,
+        optuna_seed=optuna_seed,
+        min_score=min_score,
+        max_score=max_score,
+        use_pruner=use_pruner,
+        verbose_cv=verbose_cv,
+        limit_blas_threads=limit_blas_threads,
+        show_progress_bar=show_progress_bar,
+        objective_subsample_n=objective_subsample_n,
+    )
+
+
+def optuna_tune_tfidf_mlp_svd_n_components(
+    raw_text_series: pd.Series,
+    target_values: np.ndarray,
+    stratification_bins: np.ndarray | None,
+    vectorizer_kwargs: Mapping[str, Any],
+    mlp_estimator: Any,
+    *,
+    svd_n_components_min: int = 128,
+    svd_n_components_max: int = 512,
+    n_trials: int = 20,
+    n_splits: int = 5,
+    random_state: int = 42,
+    use_sample_weights: bool = True,
+    optuna_seed: int = 42,
+    min_score: int = 0,
+    max_score: int = 5,
+    use_pruner: bool = True,
+    verbose_cv: bool = False,
+    limit_blas_threads: bool = True,
+    show_progress_bar: bool = True,
+    objective_subsample_n: Optional[int] = 4000,
+) -> Tuple[Any, pd.DataFrame]:
+    """
+    Bayesian search over ``TruncatedSVD(n_components)`` with a **fixed** ``MLPRegressor``.
+
+    Delegates to ``optuna_optimize_with_stratified_cv``; each trial suggests an integer
+    ``svd_n_components`` in ``[svd_n_components_min, svd_n_components_max]`` (inclusive).
+    Cap ``svd_n_components_max`` to at most ``max_features`` from the vectorizer and rank
+    limits in your data if you hit sklearn errors.
+
+    One-line purpose
+        Phase B: TPE on SVD width while the MLP is frozen (e.g. best from Phase A).
+
+    Parameters
+    ----------
+    raw_text_series : pd.Series
+        Cleaned text column for the TF-IDF pipeline.
+    target_values : np.ndarray
+        Ordinal targets.
+    stratification_bins : np.ndarray | None
+        CV stratification bins.
+    vectorizer_kwargs : Mapping[str, Any]
+        ``TfidfVectorizer`` kwargs — same as Section 4; not modified here.
+    mlp_estimator : Any
+        Unfitted ``MLPRegressor`` (cloned each trial).
+    svd_n_components_min : int
+        Lower bound for ``trial.suggest_int`` (inclusive).
+    svd_n_components_max : int
+        Upper bound for ``trial.suggest_int`` (inclusive).
+    n_trials : int
+        Optuna trial budget (typically smaller than MLP phase — 1-D search).
+    n_splits : int
+        CV folds.
+    random_state : int
+        CV / SVD random state.
+    use_sample_weights : bool
+        Balanced train-fold weights.
+    optuna_seed : int
+        TPE sampler seed.
+    min_score : int
+        QWK clip low.
+    max_score : int
+        QWK clip high.
+    use_pruner : bool
+        Whether to use the same MedianPruner as the generic driver.
+    verbose_cv : bool
+        If True, print each CV fold during tuning.
+    limit_blas_threads : bool
+        If True, cap BLAS threads during ``fit`` (interrupt-friendlier in notebooks).
+    show_progress_bar : bool
+        Optuna tqdm progress (one update per completed trial).
+    objective_subsample_n : int, optional
+        Same as ``optuna_tune_tfidf_mlp`` (stratified subsample for speed; ``None`` = full data).
+
+    Returns
+    -------
+    Tuple[Any, pd.DataFrame]
+        ``(study, trials_table)`` like other tuning helpers.
+    """
+
+    def build_estimator(trial: Any) -> Pipeline:
+        n_svd = trial.suggest_int(
+            "svd_n_components",
+            svd_n_components_min,
+            svd_n_components_max,
+        )
+        return make_tfidf_mlp_pipeline(
+            vectorizer_kwargs=vectorizer_kwargs,
+            n_svd_components=int(n_svd),
+            mlp_estimator=clone(mlp_estimator),
+            random_state=random_state,
+        )
+
+    return optuna_optimize_with_stratified_cv(
+        build_estimator=build_estimator,
+        raw_text_series=raw_text_series,
+        target_values=target_values,
+        stratification_bins=stratification_bins,
+        n_trials=n_trials,
+        n_splits=n_splits,
+        random_state=random_state,
+        use_sample_weights=use_sample_weights,
+        optuna_seed=optuna_seed,
+        min_score=min_score,
+        max_score=max_score,
+        use_pruner=use_pruner,
+        verbose_cv=verbose_cv,
+        limit_blas_threads=limit_blas_threads,
+        show_progress_bar=show_progress_bar,
+        objective_subsample_n=objective_subsample_n,
+    )
+
+
+def rank_optuna_trials_like_cv_leaderboard(trials_table: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sort trials like ``build_cv_leaderboard``: highest ``qwk_mean``, then lower ``mae_mean``.
+
+    One-line purpose
+        Pick the best trial with the same tie-break as Section 4.
+
+    Parameters
+    ----------
+    trials_table : pd.DataFrame
+        Table from ``optuna_optimize_with_stratified_cv`` or any TF-IDF tuning wrapper.
+
+    Returns
+    -------
+    pd.DataFrame
+        Rows with finite ``qwk_mean``, sorted for winner inspection.
+    """
+    valid = trials_table[np.isfinite(trials_table["qwk_mean"])].copy()
+    if valid.empty:
+        return valid
+    return valid.sort_values(
+        by=["qwk_mean", "mae_mean"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+
+def sweep_svd_n_components_for_tfidf_mlp(
+    raw_text_series: pd.Series,
+    target_values: np.ndarray,
+    stratification_bins: np.ndarray | None,
+    vectorizer_kwargs: Mapping[str, Any],
+    n_components_list: Sequence[int],
+    mlp_estimator: Any,
+    *,
+    n_splits: int = 5,
+    random_state: int = 42,
+    use_sample_weights: bool = True,
+    min_score: int = 0,
+    max_score: int = 5,
+) -> pd.DataFrame:
+    """
+    Grid over ``TruncatedSVD(n_components)`` with a fixed MLP (Phase B after Optuna).
+
+    Uses ``make_tfidf_mlp_pipeline`` and ``run_stratified_cv`` only — no changes to ``utils.py``.
+
+    One-line purpose
+        Compare mean CV metrics vs SVD width for a chosen ``MLPRegressor``.
+
+    Parameters
+    ----------
+    raw_text_series : pd.Series
+        Cleaned text aligned with targets.
+    target_values : np.ndarray
+        Ordinal labels.
+    stratification_bins : np.ndarray | None
+        CV stratification bins.
+    vectorizer_kwargs : Mapping[str, Any]
+        ``TfidfVectorizer`` kwargs.
+    n_components_list : Sequence[int]
+        SVD ranks to evaluate.
+    mlp_estimator : Any
+        Unfitted regressor (cloned internally).
+    n_splits : int
+        CV folds.
+    random_state : int
+        CV / SVD seed.
+    use_sample_weights : bool
+        Train-fold balanced weights.
+    min_score : int
+        QWK lower clip.
+    max_score : int
+        QWK upper clip.
+
+    Returns
+    -------
+    pd.DataFrame
+        Per ``svd_n_components``: mean/std QWK, RMSE, MAE across folds.
+    """
+    results: List[Dict[str, Any]] = []
+    for n_comp in n_components_list:
+        pipe = make_tfidf_mlp_pipeline(
+            vectorizer_kwargs=vectorizer_kwargs,
+            n_svd_components=int(n_comp),
+            mlp_estimator=clone(mlp_estimator),
+            random_state=random_state,
+        )
+        fold_df = run_stratified_cv(
+            model=pipe,
+            feature_matrix=raw_text_series,
+            target_values=target_values,
+            stratification_bins=stratification_bins,
+            n_splits=n_splits,
+            random_state=random_state,
+            use_sample_weights=use_sample_weights,
+            min_score=min_score,
+            max_score=max_score,
+        )
+        results.append(
+            {
+                "svd_n_components": int(n_comp),
+                "qwk_mean": float(fold_df["qwk"].mean()),
+                "qwk_std": float(fold_df["qwk"].std()),
+                "rmse_mean": float(fold_df["rmse"].mean()),
+                "rmse_std": float(fold_df["rmse"].std()),
+                "mae_mean": float(fold_df["mae"].mean()),
+                "mae_std": float(fold_df["mae"].std()),
+            }
+        )
+    return pd.DataFrame(results)

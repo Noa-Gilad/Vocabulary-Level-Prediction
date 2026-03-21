@@ -54,14 +54,73 @@ DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 DEFAULT_EMBEDDING_MODEL_FAST = "sentence-transformers/paraphrase-MiniLM-L3-v2"
 
 # Common English stopwords (minimal set) for word-frequency and n-gram analysis when none provided.
-DEFAULT_STOPWORDS = frozenset({
-    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "he",
-    "in", "is", "it", "its", "of", "on", "that", "the", "to", "was", "were", "will",
-    "with", "this", "but", "they", "have", "had", "what", "when", "where", "who",
-    "which", "why", "how", "all", "each", "every", "both", "few", "more", "most",
-    "other", "some", "such", "no", "nor", "not", "only", "own", "same", "so",
-    "than", "too", "very", "just", "if", "or", "because", "until", "while",
-})
+DEFAULT_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "has",
+        "he",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "that",
+        "the",
+        "to",
+        "was",
+        "were",
+        "will",
+        "with",
+        "this",
+        "but",
+        "they",
+        "have",
+        "had",
+        "what",
+        "when",
+        "where",
+        "who",
+        "which",
+        "why",
+        "how",
+        "all",
+        "each",
+        "every",
+        "both",
+        "few",
+        "more",
+        "most",
+        "other",
+        "some",
+        "such",
+        "no",
+        "nor",
+        "not",
+        "only",
+        "own",
+        "same",
+        "so",
+        "than",
+        "too",
+        "very",
+        "just",
+        "if",
+        "or",
+        "because",
+        "until",
+        "while",
+    }
+)
 
 # Penn Treebank tag groups for POS ratio computation (EDA 2.6).
 _POS_NOUN = frozenset({"NN", "NNS", "NNP", "NNPS"})
@@ -490,7 +549,11 @@ def get_sentence_count(text: str) -> int:
     if not text or not str(text).strip():
         return 0
     parts = re.split(r"[.?!]+", str(text))
-    return max(1, len([p for p in parts if p.strip()])) if any(p.strip() for p in parts) else 1
+    return (
+        max(1, len([p for p in parts if p.strip()]))
+        if any(p.strip() for p in parts)
+        else 1
+    )
 
 
 def get_avg_word_length(text: str) -> float:
@@ -723,10 +786,15 @@ def plot_length_target_heatmap(
     for tc in target_columns:
         if tc not in df.columns:
             continue
-        corr_matrix[tc] = get_length_target_correlations(features_df, df[tc], method=method)
+        corr_matrix[tc] = get_length_target_correlations(
+            features_df, df[tc], method=method
+        )
     if ax is None:
         if figsize is None:
-            figsize = (max(5, len(target_columns) * 2.5), max(4, len(feature_cols) * 1.0))
+            figsize = (
+                max(5, len(target_columns) * 2.5),
+                max(4, len(feature_cols) * 1.0),
+            )
         _, ax = plt.subplots(figsize=figsize)
     im = ax.imshow(corr_matrix.values, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
     ax.set_xticks(range(len(corr_matrix.columns)))
@@ -741,11 +809,18 @@ def plot_length_target_heatmap(
             val = corr_matrix.values[i, j]
             text_color = "white" if abs(val) > 0.5 else "black"
             ax.text(
-                j, i, f"{val:.2f}",
-                ha="center", va="center", color=text_color, fontsize=11,
+                j,
+                i,
+                f"{val:.2f}",
+                ha="center",
+                va="center",
+                color=text_color,
+                fontsize=11,
             )
     plt.colorbar(im, ax=ax, label="Spearman ρ")
-    ax.set_title(title if title is not None else f"Length features vs targets ({method})")
+    ax.set_title(
+        title if title is not None else f"Length features vs targets ({method})"
+    )
     plt.tight_layout()
     return ax
 
@@ -1008,7 +1083,9 @@ def get_top_n_words_per_score_group(
             for w in _normalize_text_for_richness(text):
                 if w and w.lower() not in stop:
                     counter[w.lower()] += 1
-        out[int(score)] = pd.Series(counter).nlargest(n) if counter else pd.Series(dtype=int)
+        out[int(score)] = (
+            pd.Series(counter).nlargest(n) if counter else pd.Series(dtype=int)
+        )
     return out
 
 
@@ -1158,7 +1235,11 @@ def _spearman_corr_binary_matrix_with_target(
     std_rank = np.std(target_ranked, ddof=0)
     if std_rank <= 0:
         return np.zeros(presence_matrix.shape[1])
-    r = (mean_1 - mean_0) * np.sqrt(np.where((n1 > 0) & (n0 > 0), n1 * n0 / (n * n), 0.0)) / std_rank
+    r = (
+        (mean_1 - mean_0)
+        * np.sqrt(np.where((n1 > 0) & (n0 > 0), n1 * n0 / (n * n), 0.0))
+        / std_rank
+    )
     return np.where((n1 > 0) & (n0 > 0), r, 0.0)
 
 
@@ -1483,7 +1564,9 @@ def plot_ngram_correlation_bars(
         ax_pos.set_yticklabels(pos.index.tolist(), fontsize=10)
         ax_pos.set_xlabel(f"Correlation with {target_name} (Spearman)")
         ax_pos.set_ylabel("N-gram")
-        ax_pos.set_title(f"Top {top_n} n-grams positively correlated with {target_name}")
+        ax_pos.set_title(
+            f"Top {top_n} n-grams positively correlated with {target_name}"
+        )
     else:
         ax_pos.set_title(f"No positive correlations with {target_name}")
     # Top negative (most negative first)
@@ -1495,7 +1578,9 @@ def plot_ngram_correlation_bars(
         ax_neg.set_yticklabels(neg.index.tolist(), fontsize=10)
         ax_neg.set_xlabel(f"Correlation with {target_name} (Spearman)")
         ax_neg.set_ylabel("N-gram")
-        ax_neg.set_title(f"Top {top_n} n-grams negatively correlated with {target_name}")
+        ax_neg.set_title(
+            f"Top {top_n} n-grams negatively correlated with {target_name}"
+        )
     else:
         ax_neg.set_title(f"No negative correlations with {target_name}")
     plt.tight_layout(pad=1.2)
@@ -1530,7 +1615,9 @@ def get_pos_ratios_df(
     # elsewhere in EDA (n-grams / richness). This ensures tokens like "word" and "word."
     # are treated consistently, and punctuation does not leak into the POS statistics.
     if nltk is None or pos_tag is None:
-        raise ImportError("get_pos_ratios_df requires nltk. Install with: pip install nltk")
+        raise ImportError(
+            "get_pos_ratios_df requires nltk. Install with: pip install nltk"
+        )
     # Ensure tagger data exists (newer NLTK: averaged_perceptron_tagger_eng; older: averaged_perceptron_tagger).
     for resource in ("averaged_perceptron_tagger_eng", "averaged_perceptron_tagger"):
         try:
@@ -1774,7 +1861,9 @@ def get_embedding_pca_2d(
         Otherwise: (pca, X_2d).
     """
     if PCA is None or StandardScaler is None:
-        raise ImportError("get_embedding_pca_2d requires sklearn. Install with: pip install scikit-learn")
+        raise ImportError(
+            "get_embedding_pca_2d requires sklearn. Install with: pip install scikit-learn"
+        )
     if df is not None and target_columns is not None:
         n_comp = min(top_k, embeddings.shape[0], embeddings.shape[1])
         if n_comp < 1:
@@ -1798,7 +1887,9 @@ def get_embedding_pca_2d(
             common = pca_scores_top.index.intersection(t.index)
             if len(common) < 2:
                 continue
-            out_corr[tc] = pca_scores_top.loc[common].corrwith(t.loc[common], method="spearman")
+            out_corr[tc] = pca_scores_top.loc[common].corrwith(
+                t.loc[common], method="spearman"
+            )
         return pca, X_2d, out_corr, pca_scores_top
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(embeddings)
@@ -2202,6 +2293,7 @@ def plot_cluster_space_score_labels(
     ax.set_ylabel("Cluster space dim 2")
     ax.set_title(title if title else "K-means cluster space (text = score)")
     import matplotlib.patches as mpatches
+
     patches = [mpatches.Patch(color=cmap(c), label=f"Cluster {c}") for c in range(k)]
     ax.legend(handles=patches, loc="best", fontsize=8)
     return ax
@@ -2294,5 +2386,7 @@ def get_handcrafted_feature_ranked_correlations(
         if len(common_t) < 2:
             continue
         corr_df[tc] = combined.loc[common_t].corrwith(t.loc[common_t], method=method)
-    corr_df["|corr|_mean"] = corr_df[[c for c in target_columns if c in corr_df.columns]].abs().mean(axis=1)
+    corr_df["|corr|_mean"] = (
+        corr_df[[c for c in target_columns if c in corr_df.columns]].abs().mean(axis=1)
+    )
     return corr_df.sort_values("|corr|_mean", ascending=False)
