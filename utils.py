@@ -1674,6 +1674,14 @@ def get_essay_embeddings(
     -------
     np.ndarray
         Shape (len(df), embedding_dim), same row order as df.index.
+
+    Notes
+    -----
+    Some ``sentence-transformers`` versions print a **BertModel LOAD REPORT** table (e.g.
+    ``embeddings.position_ids | UNEXPECTED``). That line means the checkpoint contains weight
+    keys the loaded architecture does not assign to parameters (often redundant buffers);
+    loading still succeeds and inference matches the published model. It is **not** fixed by
+    hiding warnings — upgrade the library if a release removes the noise; behaviour is unchanged.
     """
     if SentenceTransformer is None:
         raise ImportError(

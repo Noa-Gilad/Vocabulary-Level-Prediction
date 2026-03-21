@@ -1,6 +1,26 @@
+# Core numerics / ML
+numpy>=1.24.0
 pandas>=2.0.0
-matplotlib>=3.7.0
+scipy>=1.10.0
 scikit-learn>=1.3.0
+
+# Plotting
+matplotlib>=3.7.0
+
+# NLP / EDA (utils.py)
 nltk>=3.8.0
 textstat>=0.7.0
+
+# Sentence embeddings (utils.get_essay_embeddings) and future BERT section
+torch>=2.0.0
 sentence-transformers>=2.2.0
+transformers>=4.30.0
+accelerate>=0.20.0
+
+# Model selection CV (modeling_utils.py)
+xgboost>=2.0.0
+lightgbm>=4.0.0
+optuna>=3.0.0
+
+# Jupyter notebooks (Model_selection.ipynb, EDA.ipynb)
+ipykernel>=6.0.0
