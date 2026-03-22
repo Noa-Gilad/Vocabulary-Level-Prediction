@@ -2,8 +2,7 @@
 Vocabulary Level Prediction — Hugging Face Transformers helpers.
 
 Weighted regression training (e.g. RoBERTa with a scalar head), batch collation with
-``sample_weight``, tokenized ``datasets.Dataset`` builders, and evaluation metrics aligned
-with ``modeling_utils.evaluate_fold``.
+``sample_weight``, and evaluation metrics aligned with ``modeling_utils.evaluate_fold``.
 Depends optionally on ``torch`` and ``transformers``; import this module only in notebooks
 or code paths that fine-tune transformers.
 """
@@ -13,7 +12,7 @@ or code paths that fine-tune transformers.
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -212,7 +211,9 @@ def build_hf_regression_compute_metrics_fn(
         predictions, labels = eval_pred
         predictions = np.asarray(predictions, dtype=float).squeeze()
         labels = np.asarray(labels, dtype=float).squeeze()
-        metrics = evaluate_fold(labels, predictions, min_score=min_score, max_score=max_score)
+        metrics = evaluate_fold(
+            labels, predictions, min_score=min_score, max_score=max_score
+        )
         return {
             "qwk": float(metrics["qwk"]),
             "rmse": float(metrics["rmse"]),
@@ -240,7 +241,9 @@ def build_weighted_regression_data_collator(tokenizer: Any) -> Any:
         Collator suitable for ``TrainingArguments`` / ``Trainer``.
     """
     if torch is None:
-        raise ImportError("torch is required for build_weighted_regression_data_collator.")
+        raise ImportError(
+            "torch is required for build_weighted_regression_data_collator."
+        )
     try:
         from transformers import DataCollatorWithPadding
     except ImportError as exc:  # pragma: no cover
@@ -251,9 +254,13 @@ def build_weighted_regression_data_collator(tokenizer: Any) -> Any:
     pad = DataCollatorWithPadding(tokenizer, padding=True, return_tensors="pt")
 
     def collate(features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        label_list = [torch.tensor(feature.pop("labels"), dtype=torch.float32) for feature in features]
+        label_list = [
+            torch.tensor(feature.pop("labels"), dtype=torch.float32)
+            for feature in features
+        ]
         weight_list = [
-            torch.tensor(feature.pop("sample_weight"), dtype=torch.float32) for feature in features
+            torch.tensor(feature.pop("sample_weight"), dtype=torch.float32)
+            for feature in features
         ]
         batch = pad(features)
         batch["labels"] = torch.stack(label_list)
@@ -282,71 +289,3 @@ def prepare_balanced_regression_weights(y_train: np.ndarray) -> np.ndarray:
     from modeling_utils import compute_balanced_sample_weights
 
     return compute_balanced_sample_weights(y_train)
-
-
-def build_tokenized_regression_dataset(
-    tokenizer: Any,
-    texts: Sequence[str],
-    labels: np.ndarray,
-    sample_weights: np.ndarray,
-    max_length: int,
-) -> Any:
-    """
-    Build a Hugging Face ``datasets.Dataset`` for scalar regression with per-row weights.
-
-    Maps raw ``text`` to tokenizer outputs; keeps ``labels`` (float) and ``sample_weight``
-    aligned for ``WeightedRegressionTrainer`` and ``build_weighted_regression_data_collator``.
-
-    Parameters
-    ----------
-    tokenizer : PreTrainedTokenizerBase
-        Tokenizer matching the model (e.g. RoBERTa).
-    texts : Sequence[str]
-        One essay string per row (e.g. ``Text_cleaned``).
-    labels : np.ndarray
-        Scalar regression targets, same length as ``texts``.
-    sample_weights : np.ndarray
-        Non-negative weights (balanced train, or ones for val/test).
-    max_length : int
-        Maximum sequence length passed to ``tokenizer`` (truncation only; padding in collator).
-
-    Returns
-    -------
-    datasets.Dataset
-        Columns: ``input_ids``, ``attention_mask``, ``labels``, ``sample_weight``.
-    """
-    try:
-        from datasets import Dataset
-    except ImportError as exc:  # pragma: no cover
-        raise ImportError(
-            "The `datasets` package is required for build_tokenized_regression_dataset."
-        ) from exc
-
-    text_list = list(texts)
-    if not (len(text_list) == len(labels) == len(sample_weights)):
-        raise ValueError(
-            "texts, labels, and sample_weights must have the same length "
-            f"({len(text_list)}, {len(labels)}, {len(sample_weights)})."
-        )
-
-    # Closure captures tokenizer settings so notebooks do not define ad-hoc map functions.
-    def tokenize_batched_text(examples: Dict[str, Any]) -> Dict[str, Any]:
-        return tokenizer(
-            examples["text"],
-            truncation=True,
-            max_length=max_length,
-            padding=False,
-        )
-
-    raw_dataset = Dataset.from_dict(
-        {
-            "text": text_list,
-            "labels": np.asarray(labels, dtype=np.float32),
-            "sample_weight": np.asarray(sample_weights, dtype=np.float32),
-        }
-    )
-    return raw_dataset.map(
-        tokenize_batched_text,
-        batched=True,
-        remove_columns=["text"],
-    )
