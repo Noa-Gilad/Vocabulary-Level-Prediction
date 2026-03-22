@@ -4,7 +4,7 @@ Modeling utilities for vocabulary-level prediction.
 Functions for target creation, rater-agreement filtering,
 cross-validation evaluation, sample-weight generation, experiment
 orchestration (``run_all_experiments_cv`` for the full registry; ``run_registry_experiments_cv`` for row subsets),
-leaderboard aggregation, CV visualization, and Optuna helpers
+leaderboard aggregation, CV visualization, ordinal diagnostic plots, and Optuna helpers
 (``optuna_optimize_with_stratified_cv`` plus thin TF-IDF+SVD+MLP wrappers).
 Feature extraction for text/embeddings stays in ``utils.py``; this module orchestrates models.
 """
@@ -31,6 +31,7 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import (
     cohen_kappa_score,
+    confusion_matrix,
     mean_absolute_error,
     mean_squared_error,
 )
@@ -1494,6 +1495,331 @@ def plot_cv_fold_boxplot(
     ax.set_title(title)
     fig.tight_layout()
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Ordinal score diagnostics (continuous predictions vs discrete true labels)
+# ---------------------------------------------------------------------------
+
+
+def row_normalize_confusion_matrix(confusion_counts: np.ndarray) -> np.ndarray:
+    """
+    Row-normalize a confusion matrix so each row sums to 1.
+
+    Empty rows (sum 0) become all zeros in the output row.
+
+    Parameters
+    ----------
+    confusion_counts : np.ndarray
+        Square or rectangular confusion matrix of non-negative counts; rows are true
+        classes, columns are predicted classes (sklearn convention).
+
+    Returns
+    -------
+    np.ndarray
+        Same shape as ``confusion_counts``, dtype float; each row sums to 1 where the
+        original row sum was positive.
+    """
+    row_totals = confusion_counts.sum(axis=1, keepdims=True)
+    return np.divide(
+        confusion_counts,
+        row_totals,
+        out=np.zeros_like(confusion_counts, dtype=float),
+        where=row_totals > 0,
+    )
+
+
+def plot_ordinal_predicted_vs_true_scatter(
+    y_true: np.ndarray,
+    y_pred_continuous: np.ndarray,
+    *,
+    score_min: int = 0,
+    score_max: int = 5,
+    figsize: Tuple[float, float] = (5.5, 5.5),
+    title: str = "Predicted vs true",
+    xlabel: str = "True score",
+    ylabel: str = "Predicted (continuous)",
+    scatter_kwargs: Optional[Mapping[str, Any]] = None,
+) -> plt.Figure:
+    """
+    Scatter of continuous model predictions against discrete ordinal true scores.
+
+    Draws the identity line ``y = x`` on ``[score_min, score_max]`` and equal aspect so
+    calibration is easy to read when labels are integers (vertical stripes at each true
+    value).
+
+    Parameters
+    ----------
+    y_true : np.ndarray
+        Integer ordinal ground-truth labels (e.g. 0–5).
+    y_pred_continuous : np.ndarray
+        Real-valued regression outputs (same length as ``y_true``).
+    score_min : int
+        Lower bound of the score scale (axis limits and identity line).
+    score_max : int
+        Upper bound of the score scale.
+    figsize : Tuple[float, float]
+        Matplotlib figure size ``(width, height)``.
+    title : str
+        Axes title.
+    xlabel : str
+        X-axis label (typically the true score).
+    ylabel : str
+        Y-axis label (typically predicted continuous score).
+    scatter_kwargs : Mapping[str, Any] | None
+        Extra keyword arguments forwarded to ``Axes.scatter`` (e.g. ``alpha``, ``s``).
+
+    Returns
+    -------
+    plt.Figure
+        Figure containing the single axes plot.
+    """
+    scatter_kwargs = dict(scatter_kwargs or {})
+    default_scatter = {"alpha": 0.35, "s": 14, "edgecolors": "none"}
+    default_scatter.update(scatter_kwargs)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.scatter(y_true, y_pred_continuous, **default_scatter)
+    ax.plot(
+        [score_min, score_max],
+        [score_min, score_max],
+        ls="--",
+        color="gray",
+        lw=1,
+    )
+    pad = 0.1
+    ax.set_xlim(score_min - pad, score_max + pad)
+    ax.set_ylim(score_min - pad, score_max + pad)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    fig.tight_layout()
+    return fig
+
+
+def plot_ordinal_continuous_boxplot_by_true_class(
+    y_true: np.ndarray,
+    y_pred_continuous: np.ndarray,
+    *,
+    score_min: int = 0,
+    score_max: int = 5,
+    figsize: Tuple[float, float] = (7, 4.5),
+    title: str = "Predicted score by true class",
+    xlabel: str = "True score",
+    ylabel: str = "Predicted (continuous)",
+    show_identity_reference: bool = True,
+    identity_label: str = "Identity (y = x)",
+    showfliers: bool = True,
+) -> plt.Figure:
+    """
+    Boxplot of continuous predictions, grouped by each integer true class.
+
+    Optionally overlays the identity line across box positions so bias (median below or
+    above the diagonal reference) is visible for ordinal regression.
+
+    Parameters
+    ----------
+    y_true : np.ndarray
+        Integer ordinal ground-truth labels.
+    y_pred_continuous : np.ndarray
+        Real-valued predictions (same length as ``y_true``).
+    score_min : int
+        Smallest true class label to include on the x-axis.
+    score_max : int
+        Largest true class label to include on the x-axis.
+    figsize : Tuple[float, float]
+        Matplotlib figure size ``(width, height)``.
+    title : str
+        Axes title.
+    xlabel : str
+        X-axis label for true class ticks.
+    ylabel : str
+        Y-axis label for predicted values.
+    show_identity_reference : bool
+        If True, draw a dashed line through ``(k, k)`` for each class ``k`` in order
+        (mapped to matplotlib's default box positions ``1..K``).
+    identity_label : str
+        Legend label for the identity reference line.
+    showfliers : bool
+        Forwarded to ``Axes.boxplot``.
+
+    Returns
+    -------
+    plt.Figure
+        Figure containing the boxplot.
+    """
+    class_values = np.arange(score_min, score_max + 1)
+    boxplot_data = [y_pred_continuous[y_true == k] for k in class_values]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.boxplot(
+        boxplot_data,
+        labels=[str(k) for k in class_values],
+        showfliers=showfliers,
+    )
+    if show_identity_reference:
+        n_classes = len(class_values)
+        ax.plot(
+            np.arange(1, n_classes + 1),
+            class_values.astype(float),
+            color="gray",
+            ls="--",
+            lw=1,
+            label=identity_label,
+        )
+        ax.legend(loc="lower right")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    fig.tight_layout()
+    return fig
+
+
+def plot_row_normalized_confusion_matrix(
+    confusion_counts: np.ndarray,
+    *,
+    class_tick_labels: Optional[Sequence[str]] = None,
+    figsize: Tuple[float, float] = (6.5, 5.5),
+    title: str = "Confusion matrix (row-normalized)",
+    xlabel: str = "Predicted class",
+    ylabel: str = "True class",
+    cmap: str = "Blues",
+    colorbar_label: str = "Fraction of true class",
+    annotate: bool = True,
+    dark_text_threshold: float = 0.4,
+    annotation_fontsize: int = 8,
+) -> plt.Figure:
+    """
+    Heatmap of a row-normalized confusion matrix with optional percent annotations.
+
+    Each row sums to 1 (fraction of that true class assigned to each predicted column).
+    Cell text is skipped when the count is zero.
+
+    Parameters
+    ----------
+    confusion_counts : np.ndarray
+        Non-negative count matrix; rows = true class, columns = predicted class.
+    class_tick_labels : Sequence[str] | None
+        Tick labels for both axes (length must match matrix side length). If None,
+        uses ``0..n-1`` as strings.
+    figsize : Tuple[float, float]
+        Matplotlib figure size ``(width, height)``.
+    title : str
+        Axes title.
+    xlabel : str
+        X-axis label (predicted class).
+    ylabel : str
+        Y-axis label (true class).
+    cmap : str
+        Colormap name for ``imshow``.
+    colorbar_label : str
+        Label for the colorbar (row fraction scale 0–1).
+    annotate : bool
+        If True, write ``\"NN%\"`` in each cell with a positive count.
+    dark_text_threshold : float
+        Cells with row fraction above this value use white text for readability on dark
+        blue; otherwise black.
+    annotation_fontsize : int
+        Font size for cell annotations.
+
+    Returns
+    -------
+    plt.Figure
+        Figure containing the heatmap and colorbar.
+    """
+    row_fractions = row_normalize_confusion_matrix(confusion_counts)
+    n_rows, n_cols = confusion_counts.shape
+    if n_rows != n_cols:
+        raise ValueError(
+            "confusion_counts must be square for this plot; "
+            f"got shape {confusion_counts.shape}."
+        )
+    side = n_rows
+    if class_tick_labels is None:
+        tick_labels = [str(index) for index in range(side)]
+    else:
+        tick_labels = list(class_tick_labels)
+        if len(tick_labels) != side:
+            raise ValueError(
+                "class_tick_labels length must match confusion matrix side; "
+                f"got {len(tick_labels)} labels for matrix side {side}."
+            )
+
+    ordinal_indices = np.arange(side)
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(
+        row_fractions,
+        interpolation="nearest",
+        cmap=cmap,
+        vmin=0.0,
+        vmax=1.0,
+    )
+    ax.set_xticks(ordinal_indices)
+    ax.set_yticks(ordinal_indices)
+    ax.set_xticklabels(tick_labels)
+    ax.set_yticklabels(tick_labels)
+    if annotate:
+        for row_index in range(side):
+            for col_index in range(side):
+                cell_count = confusion_counts[row_index, col_index]
+                if cell_count == 0:
+                    continue
+                fraction = row_fractions[row_index, col_index]
+                text_color = "white" if fraction > dark_text_threshold else "black"
+                ax.text(
+                    col_index,
+                    row_index,
+                    f"{100 * fraction:.0f}%",
+                    ha="center",
+                    va="center",
+                    color=text_color,
+                    fontsize=annotation_fontsize,
+                )
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=colorbar_label)
+    fig.tight_layout()
+    return fig
+
+
+def plot_row_normalized_confusion_matrix_from_labels(
+    y_true: np.ndarray,
+    y_pred_ordinal: np.ndarray,
+    *,
+    labels: np.ndarray,
+    **plot_kwargs: Any,
+) -> plt.Figure:
+    """
+    Compute sklearn's confusion matrix then plot it row-normalized.
+
+    Convenience wrapper so callers do not repeat ``confusion_matrix`` + normalization.
+
+    Parameters
+    ----------
+    y_true : np.ndarray
+        Integer ground-truth labels.
+    y_pred_ordinal : np.ndarray
+        Integer predictions (same length as ``y_true``).
+    labels : np.ndarray
+        Complete label list for ``sklearn.metrics.confusion_matrix`` (fixed class order).
+    **plot_kwargs : Any
+        Forwarded to ``plot_row_normalized_confusion_matrix`` (e.g. ``title``, ``figsize``,
+        ``xlabel``, ``cmap``).
+
+    Returns
+    -------
+    plt.Figure
+        Figure from ``plot_row_normalized_confusion_matrix``.
+    """
+    counts = confusion_matrix(y_true, y_pred_ordinal, labels=labels)
+    tick_labels = [str(label_value) for label_value in labels]
+    return plot_row_normalized_confusion_matrix(
+        counts,
+        class_tick_labels=tick_labels,
+        **plot_kwargs,
+    )
 
 
 # ---------------------------------------------------------------------------
