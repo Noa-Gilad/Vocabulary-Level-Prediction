@@ -1,27 +1,87 @@
-# Core numerics / ML
+# =============================================================================
+# Vocabulary Level Prediction — FULL PROJECT (single install)
+# =============================================================================
+#
+#   pip install -r requirements.txt
+#
+# Installs every direct third-party dependency used by this repo’s Python files and
+# notebooks, plus explicit pins for common Hugging Face / Jupyter companions (so a
+# fresh venv runs without hunting missing wheels).
+#
+# Setup:
+#   python -m venv .venv
+#   .venv\Scripts\activate          # Windows
+#   # source .venv/bin/activate      # macOS / Linux
+#   python -m pip install --upgrade pip
+#   pip install -r requirements.txt
+#
+# Python 3.10+ recommended.
+#
+# -----------------------------------------------------------------------------
+# CHECKLIST: third-party imports in code → PyPI package (all covered below)
+# -----------------------------------------------------------------------------
+#   IPython.*              → ipython
+#   matplotlib.*           → matplotlib
+#   numpy                  → numpy
+#   pandas                 → pandas
+#   scipy (sklearn uses)   → scipy
+#   sklearn.*              → scikit-learn
+#   torch.*                → torch
+#   transformers.*         → transformers
+#   nltk.*                 → nltk
+#   textstat               → textstat
+#   sentence_transformers  → sentence-transformers
+#   threadpoolctl          → threadpoolctl
+#   optuna.*               → optuna
+#   xgboost                → xgboost
+#   lightgbm               → lightgbm
+#   (stdlib: importlib, os, re, typing, warnings, … — not listed)
+# =============================================================================
+
+# --- Core numerics & scikit-learn ---
 numpy>=1.24.0
 pandas>=2.0.0
 scipy>=1.10.0
 scikit-learn>=1.3.0
 threadpoolctl>=3.0.0
 
-# Plotting
+# --- Plotting (matplotlib.patches used in utils) ---
 matplotlib>=3.7.0
+Pillow>=9.0.0
 
-# NLP / EDA (utils.py)
+# --- NLP / readability (utils) ---
 nltk>=3.8.0
 textstat>=0.7.0
 
-# Sentence embeddings (utils.get_essay_embeddings) and future BERT section
+# --- PyTorch & Hugging Face (transformers_utils; embeddings; RoBERTa) ---
 torch>=2.0.0
-sentence-transformers>=2.2.0
 transformers>=4.30.0
 accelerate>=0.20.0
+datasets>=2.14.0
+safetensors>=0.4.0
+sentence-transformers>=2.2.0
+tokenizers>=0.13.0
+huggingface_hub>=0.19.0
 
-# Model selection CV (modeling_utils.py)
+# --- HF / datasets runtime (configs, Hub HTTP, cache locks — explicit for one-shot envs) ---
+requests>=2.28.0
+PyYAML>=6.0
+filelock>=3.12.0
+regex>=2023.0.0
+protobuf>=4.21.0
+
+# --- Gradient boosting (Model_selection) ---
 xgboost>=2.0.0
 lightgbm>=4.0.0
+
+# --- Hyperparameter search ---
 optuna>=3.0.0
 
-# Jupyter notebooks (Model_selection.ipynb, EDA.ipynb)
+# --- Jupyter & IPython (Model_selection, EDA — display, kernels, classic + Lab UI) ---
 ipykernel>=6.0.0
+ipython>=8.0.0
+jupyterlab>=4.0.0
+notebook>=7.0.0
+
+# --- Progress (explicit; also transitive for Optuna / HF) ---
+tqdm>=4.65.0
