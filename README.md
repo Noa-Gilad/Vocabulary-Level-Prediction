@@ -16,7 +16,7 @@ This README is written as the main review document. The methodological choices, 
 
 - `EDA.ipynb`: exploratory data analysis and feature diagnostics.
 - `Model_selection.ipynb`: classical model registry, cross-validation, Optuna tuning, final test evaluation.
-- `BERT_comparison.ipynb`: transformer training pipeline (pending final run outputs).
+- `BERT_comparison.ipynb`: transformer training pipeline.
 - `modeling_utils.py`: preprocessing helpers, CV runner, metrics, weighting, Optuna wrappers, plotting utilities.
 - `utils.py`: text preprocessing, handcrafted feature extraction, readability and embedding helpers.
 - `transformers_utils.py`: weighted trainer and transformer tuning utilities.
@@ -245,6 +245,11 @@ Conclusion:
 - TF-IDF-based models provide substantially stronger predictive performance;
 - TF-IDF + MLP emerged as the leading classical candidate in the logged run.
 
+CV leaderboard figures (mean fold metrics) are exported as:
+- `Figures/cv_mean_qwk.png`
+- `Figures/cv_mean_rmse.png`
+- `Figures/cv_mean_mae.png`
+
 ---
 
 ## 5. Classical Hyperparameter Tuning (Optuna)
@@ -303,19 +308,24 @@ Diagnostics generated in notebook:
 - continuous prediction distribution by true class (boxplot);
 - row-normalized confusion matrix on rounded predictions.
 
----
+Interpretation from those diagnostics:
+- predictions track the ordinal trend but with visible dispersion around the diagonal;
+- neighboring score levels are frequently mixed (most confusion is between adjacent classes), which is consistent with the QWK objective;
+- lower levels (`0-1`) are harder to predict reliably, consistent with their underrepresentation in the label distribution.
 
-**Complementary modeling hypothesis - Transformers**  
-   Classical pipelines (handcrafted, TF-IDF, frozen embeddings) mainly capture explicit lexical frequency and engineered signals. A transformer was evaluated to test whether contextual sequence representations from pretrained language modeling improve ordinal vocabulary prediction beyond those classical feature spaces.
+**Complementary modeling hypothesis (transformer track).**  
+Classical pipelines (handcrafted, TF-IDF, frozen embeddings) mainly capture explicit lexical frequency and engineered signals. A transformer was evaluated to test whether contextual sequence representations from pretrained language modeling improve ordinal vocabulary prediction beyond those classical feature spaces.
+
+---
 
 ## 7. Why Transformers Are Separated from Classical Models
 
 The separation is methodological and intentional.
 
-2. **Different compute regime**  
+1. **Different compute regime**  
    Classical models support broad 5-fold registry sweeps; transformer full k-fold sweeps are significantly more expensive.
 
-3. **Different optimization structure**  
+2. **Different optimization structure**  
    Transformer fine-tuning introduces sequence length, batch scheduling, GPU memory constraints, and trainer-specific pruning/storage behavior.
 
 ---
@@ -328,11 +338,11 @@ Pretrained **`roberta-base`** was fine-tuned **end-to-end** for scalar regressio
 
 ### 8.2 Baseline fine-tune vs Optuna search
 
-A **baseline** run was defined as the first end-to-end fine-tuning recipe in 6: conservative, standard transformer defaults (**learning rate `2e-5`**, **`3` epochs**, **per-device train/eval batch size `8`**, **weight decay `0.01`**), with the best checkpoint selected by **validation QWK** (`load_best_model_at_end`, `metric_for_best_model="qwk"`). That run yielded **validation QWK ≈ 0.5963**.
+A **baseline** run was defined as an initial end-to-end fine-tuning recipe using conservative, standard transformer defaults (**learning rate `2e-5`**, **`3` epochs**, **per-device train/eval batch size `8`**, **weight decay `0.01`**), with the best checkpoint selected by **validation QWK** (`load_best_model_at_end`, `metric_for_best_model="qwk"`). That run yielded **validation QWK ≈ 0.5963**.
 
 **Full tuning** kept the same architecture and data split, but replaced fixed baseline settings with a **15-trial Optuna** search over learning rate, epochs, train batch size, weight decay, and warmup ratio; study state was persisted in **`optuna_roberta.db`** and pruning used **MedianPruner** on epoch-level objectives. The **best trial** reached **validation QWK ≈ 0.5681** (hyperparameters logged in notebook output).
 
-Because tuned validation QWK **did not exceed** baseline, the **7 acceptance rule retained baseline hyperparameters** for final refit. **Phase B** then retrained **from scratch on the entire agreement-filtered training corpus**, producing the single checkpoint used for test prediction.
+Because tuned validation QWK **did not exceed** baseline, **baseline hyperparameters were retained** for final refit (selection by validation QWK, not Optuna trial rank). **Phase B** then retrained **from scratch on the entire agreement-filtered training corpus**, producing the single checkpoint used for test prediction.
 
 ### 8.3 Test metrics (held-out test)
 
@@ -340,11 +350,15 @@ Because tuned validation QWK **did not exceed** baseline, the **7 acceptance rul
 |---|-----|------|-----|
 | **RoBERTa (final refit)** | **0.564896** | **0.689487** | **0.529520** |
 
-For comparison, the classical TF-IDF + SVD + MLP test row in §6 reported **QWK 0.532867**, **RMSE 0.708233**, **MAE 0.569546**. On this split, the RoBERTa pipeline improved all three metrics.
+For comparison, the classical TF-IDF + SVD + MLP test row in **Section 6** reported **QWK 0.532867**, **RMSE 0.708233**, **MAE 0.569546**. On this split, the RoBERTa pipeline improved all three metrics.
 
 **Note:** The summary table in the notebook is indexed as `Test set (RoBERTa, tuned)`; given the selection rule above, the evaluated checkpoint corresponds to the **baseline training recipe** after Phase B full-train refit, not the Optuna-best trial.
 
 Qualitatively, predictions follow the ordinal trend and errors remain mostly local (adjacent levels). Relative to TF-IDF + MLP, mid-range behavior is broadly similar, while the transformer shows clearer improvement at the upper end of the scale: **true levels 4 and 5 align more strongly with the confusion-matrix diagonal**. Low true levels (especially 0-2) remain less separable and are often shifted upward toward middle scores, consistent with class sparsity and rater ambiguity near neighboring bands.
+
+Figure exports for direct inspection of those test diagnostics:
+- **Classical (TF-IDF + SVD + MLP):** `Figures/tfidf_mlp_test_scatter.png`, `Figures/tfidf_mlp_test_boxplot.png`, `Figures/tfidf_mlp_test_confusion.png`
+- **RoBERTa (final refit):** `Figures/roberta_test_scatter.png`, `Figures/roberta_test_boxplot.png`, `Figures/roberta_test_confusion.png`
 
 ---
 
